@@ -1,9 +1,10 @@
 
+import os
 import re
 import pandas as pd
 import requests
 
-TOKEN = "GITHUB_TOKEN"
+TOKEN = ""
 gh = requests.Session()                      # all GitHub calls share these headers
 gh.headers.update({
     "Authorization": f"Bearer {TOKEN}",
@@ -21,16 +22,10 @@ OUT = "dataset_initial.csv"
 
 PACKAGES = ["debug-js/debug","mochajs/mocha", "chaijs/chai", "sinonjs/sinon", "fastify/fastify",
     "koajs/koa", "sveltejs/svelte", "preactjs/preact",
-    "gulpjs/gulp", "rollup/rollup", "evanw/esbuild",
+     "rollup/rollup", "evanw/esbuild",
     "postcss/postcss", "winstonjs/winston", "pinojs/pino", "expressjs/multer",
     "expressjs/morgan", "handlebars-lang/handlebars.js", "node-fetch/node-fetch",
-    "sindresorhus/got", "jprichardson/node-fs-extra", "isaacs/node-glob",
-    "micromatch/micromatch", "kelektiv/node.bcrypt.js",
-    "auth0/node-jsonwebtoken", "sidorares/node-mysql2",
-    "typeorm/typeorm", "sequelize/sequelize", "knex/knex",
-    "graphql/graphql-js",
-    "pmndrs/zustand", "immerjs/immer", "d3/d3", "chartjs/Chart.js",
-    "mrdoob/three.js", 
+    "sindresorhus/got" 
 ]          
 
 
@@ -193,6 +188,7 @@ def main():
         done = set(pd.read_csv(OUT, usecols=["purl"]).purl
                    .str.rsplit("@", n=1).str[0].str.removeprefix("pkg:npm/"))
     for repo in PACKAGES:
+        pkg = repo.rsplit("/", 1)[-1]
         print("==", repo, "->", pkg)
         if pkg in done:
             print("  already in output, skipped")
