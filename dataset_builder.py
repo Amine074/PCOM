@@ -3,8 +3,11 @@ import os
 import re
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
-TOKEN = ""
+
+load_dotenv()
+TOKEN = os.getenv("GITHUB_TOKEN")
 gh = requests.Session()                      # all GitHub calls share these headers
 gh.headers.update({
     "Authorization": f"Bearer {TOKEN}",
@@ -25,7 +28,26 @@ PACKAGES = ["debug-js/debug","mochajs/mocha", "chaijs/chai", "sinonjs/sinon", "f
      "rollup/rollup", "evanw/esbuild",
     "postcss/postcss", "winstonjs/winston", "pinojs/pino", "expressjs/multer",
     "expressjs/morgan", "handlebars-lang/handlebars.js", "node-fetch/node-fetch",
-    "sindresorhus/got" 
+    "sindresorhus/got", "expressjs/express",
+    "axios/axios",
+    "lodash/lodash",
+    "webpack/webpack",
+    "vitejs/vite",
+    "colinhacks/zod",
+    "chalk/chalk",
+    "date-fns/date-fns",
+    "moment/moment",
+    "uuidjs/uuid",
+    "markedjs/marked",
+    "motdotla/dotenv",
+    "nodemailer/nodemailer",
+    "Automattic/mongoose",
+    "sequelize/sequelize",
+    "prisma/prisma",
+    "typeorm/typeorm",
+    "nestjs/nest",
+    "remix-run/react-router",
+    "tanstack/query"
 ]          
 
 
