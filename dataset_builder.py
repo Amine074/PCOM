@@ -1,6 +1,6 @@
-
 import os
 import re
+import time
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -8,11 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("GITHUB_TOKEN")
-gh = requests.Session()                      # all GitHub calls share these headers
+gh = requests.Session()                       # all GitHub calls share these headers
 gh.headers.update({
     "Authorization": f"Bearer {TOKEN}",
     "Accept": "application/vnd.github+json",
-    
 })
 
 # M0 = newest month, M11 = oldest
@@ -48,8 +47,7 @@ PACKAGES = ["debug-js/debug","mochajs/mocha", "chaijs/chai", "sinonjs/sinon", "f
     "nestjs/nest",
     "remix-run/react-router",
     "tanstack/query"
-]          
-
+]         
 
 STABLE = re.compile(r"^\d+\.\d+\.\d+$")
 
@@ -65,19 +63,108 @@ def pages(url, params=None):
         url, params = r.links.get("next", {}).get("url"), None
 
 
-# ---------------------------------------------------------------- raw github data
+# ---------------------------------------------------------------- raw github data (GraphQL)
 def load_issue_tables(repo):
-    base = f"https://api.github.com/repos/{repo}"
-    issues = pd.DataFrame(
-        [{"number": i["number"], "is_pr": "pull_request" in i, "ts": i["created_at"]}
-         for i in pages(f"{base}/issues", {"state": "all"})],
-        columns=["number", "is_pr", "ts"])
-    events = pd.DataFrame(
-        [{"number": e["issue"]["number"], "is_pr": "pull_request" in e["issue"],
-          "event": e["event"], "ts": e["created_at"]}
-         for e in pages(f"{base}/issues/events")
-         if e.get("issue") and e["event"] in ("closed", "reopened", "merged")],
-        columns=["number", "is_pr", "event", "ts"])
+    owner, name = repo.split("/", 1)
+    query = """
+    query($owner: String!, $name: String!, $cursorIssues: String, $cursorPRs: String) {
+      repository(owner: $owner, name: $name) {
+        issues(first: 100, after: $cursorIssues, orderBy: {field: CREATED_AT, direction: ASC}) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            number
+            createdAt
+            timelineItems(first: 50, itemTypes: [CLOSED_EVENT, REOPENED_EVENT]) {
+              nodes {
+                __typename
+                ... on ClosedEvent { id createdAt }
+                ... on ReopenedEvent { id createdAt }
+              }
+            }
+          }
+        }
+        pullRequests(first: 100, after: $cursorPRs, orderBy: {field: CREATED_AT, direction: ASC}) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            number
+            createdAt
+            mergedAt
+            timelineItems(first: 50, itemTypes: [CLOSED_EVENT, REOPENED_EVENT]) {
+              nodes {
+                __typename
+                ... on ClosedEvent { id createdAt }
+                ... on ReopenedEvent { id createdAt }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    issue_rows, event_rows = [], []
+    c_issues, c_prs = None, None
+    has_issues, has_prs = True, True
+    page_num = 0
+
+    while has_issues or has_prs:
+        page_num += 1
+        print(f"\r     -> Lade GitHub GraphQL Seite {page_num} ({len(issue_rows)} Issues/PRs)...", end="", flush=True)
+
+        variables = {
+            "owner": owner,
+            "name": name,
+            "cursorIssues": c_issues if has_issues else None,
+            "cursorPRs": c_prs if has_prs else None,
+        }
+        r = gh.post("https://api.github.com/graphql",
+                    json={"query": query, "variables": variables}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if "errors" in data:
+            print()
+            raise RuntimeError(data["errors"])
+
+        repo_data = data["data"]["repository"]
+
+        if has_issues:
+            iss_block = repo_data["issues"]
+            for node in iss_block["nodes"]:
+                num = node["number"]
+                issue_rows.append({"number": num, "is_pr": False, "ts": node["createdAt"]})
+                for ev in node["timelineItems"]["nodes"]:
+                    ev_name = "closed" if ev["__typename"] == "ClosedEvent" else "reopened"
+                    event_rows.append({
+                        "id": ev["id"], "number": num, "is_pr": False,
+                        "event": ev_name, "ts": ev["createdAt"]
+                    })
+            has_issues = iss_block["pageInfo"]["hasNextPage"]
+            c_issues = iss_block["pageInfo"]["endCursor"]
+
+        if has_prs:
+            pr_block = repo_data["pullRequests"]
+            for node in pr_block["nodes"]:
+                num = node["number"]
+                issue_rows.append({"number": num, "is_pr": True, "ts": node["createdAt"]})
+                if node.get("mergedAt"):
+                    event_rows.append({
+                        "id": f"merge_{num}", "number": num, "is_pr": True,
+                        "event": "merged", "ts": node["mergedAt"]
+                    })
+                for ev in node["timelineItems"]["nodes"]:
+                    ev_name = "closed" if ev["__typename"] == "ClosedEvent" else "reopened"
+                    event_rows.append({
+                        "id": ev["id"], "number": num, "is_pr": True,
+                        "event": ev_name, "ts": ev["createdAt"]
+                    })
+            has_prs = pr_block["pageInfo"]["hasNextPage"]
+            c_prs = pr_block["pageInfo"]["endCursor"]
+
+    print(f"\r     -> GitHub fertig: {len(issue_rows)} Issues/PRs, {len(event_rows)} Events geladen.        ")
+
+    issues = pd.DataFrame(issue_rows, columns=["number", "is_pr", "ts"]).drop_duplicates(subset=["number"])
+    events = pd.DataFrame(event_rows, columns=["id", "number", "is_pr", "event", "ts"]).drop_duplicates(subset=["id"])
+
     for df in (issues, events):
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
     return issues, events
@@ -126,11 +213,23 @@ def github_monthly(repo):
 
 
 # ---------------------------------------------------------------- advisories
+def duplicates(da):
+    """Filtert Advisories heraus, deren Summary mit 'duplicate' beginnt."""
+    return [
+        item for item in da
+        if not (item.get("summary") or "").strip().lower().startswith("duplicate")
+    ]
+
+
 def advisory_table(pkg):
-    rows = [{"ts": a["published_at"], "sev": a.get("severity") or "unknown"}
-            for a in pages("https://api.github.com/advisories",
-                           {"ecosystem": "npm", "affects": pkg})]
-    df = pd.DataFrame(rows, columns=["ts", "sev"])
+    raw_advisories = list(pages("https://api.github.com/advisories",
+                                {"ecosystem": "npm", "affects": pkg}))
+    clean_advisories = duplicates(raw_advisories)
+    
+    rows = [{"id": a.get("ghsa_id"), "ts": a["published_at"], "sev": a.get("severity") or "unknown"}
+            for a in clean_advisories]
+            
+    df = pd.DataFrame(rows, columns=["id", "ts", "sev"]).drop_duplicates(subset=["id"])
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df["sev"] = df.sev.replace({"medium": "moderate"})
     return df
@@ -204,34 +303,52 @@ def version_rows(meta, shared):
 
 # ---------------------------------------------------------------- main
 def main():
+    total = len(PACKAGES)
+    start_total = time.time()
     header = not os.path.exists(OUT)
     done = set()
     if not header:                           
         done = set(pd.read_csv(OUT, usecols=["purl"]).purl
                    .str.rsplit("@", n=1).str[0].str.removeprefix("pkg:npm/"))
-    for repo in PACKAGES:
+
+    for idx, repo in enumerate(PACKAGES, start=1):
         pkg = repo.rsplit("/", 1)[-1]
-        print("==", repo, "->", pkg)
+        print(f"\n[{idx}/{total}] == {repo} -> {pkg} ==")
         if pkg in done:
-            print("  already in output, skipped")
+            print("     -> bereits in CSV vorhanden, übersprungen.")
             continue
+
+        t0 = time.time()
         try:
+            print("     -> Lade npm Metadaten & Downloads...")
             reg = requests.get(f"https://registry.npmjs.org/{pkg.replace('/', '%2F')}",
                                timeout=30)
             reg.raise_for_status()
             meta = reg.json()
-            shared = {**npm_monthly(meta["name"], meta),
-                      **github_monthly(repo),
-                      **ghsa_features(pkg)}
+            npm_data = npm_monthly(meta["name"], meta)
+
+            gh_data = github_monthly(repo)
+
+            print("     -> Lade Security Advisories...")
+            ghsa_data = ghsa_features(meta["name"])
+
+            shared = {**npm_data, **gh_data, **ghsa_data}
             rows = version_rows(meta, shared)
         except Exception as exc:
-            print("  skipped:", exc)
+            print(f"     -> ÜBERSPRUNGEN wegen Fehler: {exc}")
             continue
+
+        elapsed = time.time() - t0
         if rows:
             pd.DataFrame(rows).to_csv(OUT, mode="a", index=False, header=header,
                                       na_rep="null", encoding="utf-8")
             header = False
-            print(f"  saved {len(rows)} versions")
+            print(f"     -> Fertig in {elapsed:.1f}s ({len(rows)} Versionen gespeichert)")
+        else:
+            print(f"     -> Fertig in {elapsed:.1f}s (0 Versionen im Zeitfenster gefunden)")
+
+    total_elapsed = time.time() - start_total
+    print(f"\nAlle {total} Pakete abgeschlossen in {total_elapsed:.1f}s!")
 
 
 if __name__ == "__main__":
