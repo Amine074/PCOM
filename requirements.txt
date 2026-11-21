@@ -2,3 +2,10 @@ fastapi[standard]>=0.115.0
 pandas>=2.0.0
 requests>=2.31.0
 uvicorn>=0.30.0
+cat <<'EOF' >> requirements.txt
+scikit-learn
+joblib
+numpy
+packaging
+EOF
+uv add scikit-learn joblib numpy packaging
