@@ -1,160 +1,105 @@
-#!/usr/bin/env python3
-"""Train the XGBoost models.
+"""Train one Poisson Gradient Boosting model for each 90-day GHSA target."""
+from __future__ import annotations
 
-Usage:
-    python train.py dataset_initial.csv [more_data.csv ...]
-
-- Needs:  pip install xgboost numpy
-- One training example per package (data of its newest version).
-- One XGBoost model per severity (low, moderate, high, critical, unknown).
-  Objective: count:poisson. The model predicts the expected number of new
-  advisories in 90 days (a float).
-- Prints a cross-validation table: XGBoost against two simple baselines.
-- Saves the models in the folder  model/  (next to this file).
-"""
-import datetime
+import argparse
 import json
-import math
-import os
-import sys
 
-try:
-    import numpy as np
-    import xgboost as xgb
-except ImportError:
-    sys.exit("Please install the packages first:  pip install xgboost numpy")
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
 
-from features import (DEFAULT_META, FEATURE_NAMES, SEVERITIES, TARGET_COLUMNS, feature_vector,
-                      merge_rows, package_name, read_rows, recent_rate, to_number)
+from features import TARGETS, get_feature_columns, make_package_dataset
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(HERE, "model")
-
-# Small trees and strong regularization, because we have few training packages.
-PARAMS = {"objective": "count:poisson", "max_depth": 2, "eta": 0.05, "min_child_weight": 0.5,
-          "lambda": 5.0, "subsample": 1.0, "seed": 0, "nthread": 1, "verbosity": 0}
-ROUNDS = 100
-
-
-def load_packages(paths):
-    """{package name: data of the package as one dict}"""
-    packages = {}
-    for path in paths:
-        by_package = {}
-        for row in read_rows(path):
-            by_package.setdefault(package_name(row.get("purl")), []).append(row)
-        for name, rows in by_package.items():
-            if name and name not in packages:
-                packages[name] = merge_rows(rows)
-    return packages
+RANDOM_STATE = 42
+MODEL_PARAMS = {
+    "loss": "poisson",
+    "max_iter": 150,
+    "learning_rate": 0.05,
+    "max_depth": 2,
+    "min_samples_leaf": 5,
+    "random_state": RANDOM_STATE,
+}
 
 
-def make_dataset(packages):
-    X, Y, R, names, skipped = [], [], [], [], 0
-    for name, rec in sorted(packages.items()):
-        targets = [to_number(rec.get(c)) for c in TARGET_COLUMNS]
-        if any(t is None for t in targets):
-            skipped += 1
-            continue
-        X.append(feature_vector(rec))
-        Y.append(targets)
-        R.append([recent_rate(rec, s) for s in SEVERITIES])
-        names.append(name)
-    return (np.array(X, dtype=float), np.array(Y, dtype=float),
-            np.array(R, dtype=float), names, skipped)
+def build_regressor() -> HistGradientBoostingRegressor:
+    """Create a Poisson gradient boosting regressor for count targets."""
+    return HistGradientBoostingRegressor(**MODEL_PARAMS)
 
 
-def fit_booster(X, y):
-    params = dict(PARAMS)
-    params["base_score"] = max(float(y.mean()), 0.001)  # start at the average count
-    return xgb.train(params, xgb.DMatrix(X, label=y), num_boost_round=ROUNDS)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input", nargs="?", default="training_data.csv")
+    parser.add_argument("--model", default="pcom_models.joblib")
+    parser.add_argument("--package-csv", default="package_training_data.csv")
+    parser.add_argument("--test-size", type=float, default=0.20)
+    args = parser.parse_args()
 
+    data, _ = make_package_dataset(args.input)
+    data.to_csv(args.package_csv, index=False)
+    features = get_feature_columns(data)
+    if not features:
+        raise ValueError("No usable numeric feature columns found.")
 
-def booster_predict(booster, X):
-    return np.clip(booster.predict(xgb.DMatrix(X)), 0.0, None)
+    X = data[features].apply(pd.to_numeric, errors="coerce")
+    y = data[TARGETS].apply(pd.to_numeric, errors="coerce").fillna(0)
 
+    if len(data) < 10:
+        raise ValueError(f"Only {len(data)} packages available; need at least 10 for a holdout test.")
 
-def poisson_log_score(Y, L):
-    """Average (over packages) of the log probability of the true counts. Higher is better."""
-    L = np.clip(L, 0.01, None)
-    log_factorial = np.array([[math.lgamma(v + 1) for v in row] for row in Y])
-    return float(np.mean(np.sum(Y * np.log(L) - L - log_factorial, axis=1)))
+    train_idx, test_idx = train_test_split(
+        np.arange(len(data)), test_size=args.test_size, random_state=RANDOM_STATE
+    )
+    models = {}
+    report = {}
 
+    for target in TARGETS:
+        y_train = y.iloc[train_idx][target]
+        y_test = y.iloc[test_idx][target]
 
-def cross_validate(X, Y, R, folds=5):
-    """Cross-validation by package (every package is in the test part exactly once)."""
-    n = len(X)
-    order = np.random.RandomState(0).permutation(n)
-    pred = {k: np.zeros_like(Y) for k in ("constant", "rule", "xgboost")}
-    w = DEFAULT_META["weight_recent"]
-    for k in range(folds):
-        test = order[k::folds]
-        train = np.setdiff1d(order, test)
-        mean = Y[train].mean(axis=0)
-        for j in range(Y.shape[1]):
-            pred["constant"][test, j] = mean[j]
-            pred["rule"][test, j] = w * R[test, j] + (1 - w) * mean[j]
-            y = Y[train, j]
-            pred["xgboost"][test, j] = (0.0 if y.sum() == 0 else
-                                        booster_predict(fit_booster(X[train], y), X[test]))
-    print("\nCross-validation by package (%d packages, %d folds)" % (n, folds))
-    print("%-34s %14s %18s" % ("method", "log score", "abs. error/package"))
-    print("%-34s %14s %18s" % ("", "(higher=better)", "(lower=better)"))
-    for key, label in (("constant", "constant (training average)"),
-                       ("rule", "simple rule (last 12 months)"),
-                       ("xgboost", "XGBoost")):
-        print("%-34s %14.3f %18.3f" % (label, poisson_log_score(Y, pred[key]),
-                                       float(np.mean(np.sum(np.abs(pred[key] - Y), axis=1)))))
+        # 1. Holdout evaluation on the 80/20 split
+        if y_train.nunique() <= 1:
+            predictions = np.full(len(test_idx), float(y_train.iloc[0]))
+        else:
+            eval_model = build_regressor()
+            eval_model.fit(X.iloc[train_idx], y_train)
+            predictions = eval_model.predict(X.iloc[test_idx])
 
+        predictions = np.maximum(0.0, predictions)
+        report[target] = {
+            "mae": float(mean_absolute_error(y_test, predictions)),
+            "rmse": float(np.sqrt(mean_squared_error(y_test, predictions))),
+            "test_actual_positive": int((y_test > 0).sum()),
+            "test_rows": int(len(y_test)),
+            "model_type": "constant" if y[target].nunique() <= 1 else "model",
+        }
 
-def main(paths):
-    packages = load_packages(paths)
-    X, Y, R, names, skipped = make_dataset(packages)
-    print("Packages used for training: %d (skipped without target values: %d)"
-          % (len(names), skipped))
-    if len(names) < 2:
-        sys.exit("Not enough packages with target values to train.")
-    print("Packages with at least one new advisory in 90 days: %d" % int((Y.sum(axis=1) > 0).sum()))
+        # 2. Fit final model on 100% of packages for prediction rounds
+        if y[target].nunique() <= 1:
+            models[target] = {"type": "constant", "value": float(y[target].iloc[0])}
+        else:
+            final_model = build_regressor()
+            final_model.fit(X, y[target])
+            models[target] = {"type": "model", "estimator": final_model}
 
-    if len(names) >= 10:
-        cross_validate(X, Y, R, folds=min(5, len(names)))
-    else:
-        print("\n(Fewer than 10 packages: cross-validation skipped, it would not mean much.)")
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    constant_zero = []
-    print()
-    for j, sev in enumerate(SEVERITIES):
-        path = os.path.join(MODEL_DIR, "xgb_%s.json" % sev)
-        if os.path.exists(path):
-            os.remove(path)
-        if Y[:, j].sum() == 0:
-            constant_zero.append(sev)
-            print("%-9s no training package has such an advisory -> always predicts 0.0" % sev)
-            continue
-        booster = fit_booster(X, Y[:, j])
-        booster.save_model(path)
-        gain = booster.get_score(importance_type="gain")  # keys look like "f12"
-        top = sorted(gain.items(), key=lambda kv: -kv[1])[:3]
-        shown = ", ".join(FEATURE_NAMES[int(k[1:])] for k, _ in top) if top else "(no splits)"
-        print("%-9s model saved. Most used features: %s" % (sev, shown))
-
-    meta = {
-        "feature_names": FEATURE_NAMES,
-        "constant_zero": constant_zero,
-        "global_mean": {s: round(float(Y[:, j].mean()), 4) for j, s in enumerate(SEVERITIES)},
-        "weight_recent": DEFAULT_META["weight_recent"],
-        "trained_on_packages": len(names),
-        "trained_on_date": datetime.date.today().isoformat(),
-        "xgboost_version": xgb.__version__,
+    bundle = {
+        "models": models,
+        "feature_columns": features,
+        "target_columns": TARGETS,
+        "parameters": MODEL_PARAMS,
+        "as_of_date": "2026-07-01",
+        "package_count": int(len(data)),
     }
-    with open(os.path.join(MODEL_DIR, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-    print("\nSaved the models in", MODEL_DIR)
+    joblib.dump(bundle, args.model)
+
+    print(f"Packages: {len(data)}")
+    print(f"Features used: {len(features)}")
+    print(f"Saved model bundle: {args.model}")
+    print("Holdout results (MAE / RMSE):")
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(2)
-    main(sys.argv[1:])
+    main()

@@ -1,149 +1,190 @@
-"""Shared code for train.py and predict.py:
-read the CSV, pick the data of ONE package, and build the list of features."""
-import csv
-import io
-import math
+"""Create one machine-learning row per npm package from version-level records."""
+from __future__ import annotations
+
+import argparse
 import re
-from datetime import datetime, timezone
+from pathlib import Path
+from typing import Tuple
 
-SEVERITIES = ("low", "moderate", "high", "critical", "unknown")
-KNOWN = SEVERITIES[:4]
-TARGET_COLUMNS = ["target_ghsa_%s_count_90d" % s for s in SEVERITIES]
-MISSING = {"", "null", "none", "nan", "na", "n/a"}
-NAN = float("nan")
-PREDICTION_DATE = datetime(2026, 7, 1, tzinfo=timezone.utc)  # M0 = June 2026 in the record schema
+import pandas as pd
+from packaging.version import Version, InvalidVersion
 
-# Used by the simple fallback rule, and if model/meta.json is missing.
-DEFAULT_META = {
-    "weight_recent": 0.6,
-    "global_mean": {"low": 0.0714, "moderate": 0.5, "high": 0.3571,
-                    "critical": 0.0, "unknown": 0.0},
-}
+TARGETS = [
+    "target_ghsa_low_count_90d",
+    "target_ghsa_moderate_count_90d",
+    "target_ghsa_high_count_90d",
+    "target_ghsa_critical_count_90d",
+    "target_ghsa_unknown_count_90d",
+]
+AS_OF_DATE = pd.Timestamp("2026-07-01", tz="UTC")
 
-
-# ---------------------------------------------------------------- reading the CSV
-def is_missing(value):
-    return value is None or str(value).strip().lower() in MISSING
+# Other names that could mean "purl" in a CSV file.
+PURL_ALIASES = ["package_url", "package_purl", "pkg_purl", "purl_id", "package", "id"]
 
 
-def to_number(value):
-    """Text -> number, or None if the value is missing or not a valid number >= 0."""
-    if is_missing(value):
-        return None
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean column names so small naming differences do not break the code."""
+    df = df.copy()
+    # remove BOM / spaces and use lower case
+    df.columns = [str(c).replace("﻿", "").strip().lower() for c in df.columns]
+
+    renames = {}
+    for c in df.columns:
+        new = c
+        # old names -> names of the record schema
+        new = re.sub(r"^(issues_(?:opened|closed|reopened))_count_m(\d+)$", r"\1_m\2", new)
+        new = re.sub(r"^package_downloads_days_observed_", "package_download_days_observed_", new)
+        if new == "created_at":
+            new = "package_created_at"
+        # the schema writes the month as upper case M0 ... M11
+        new = re.sub(r"_m(\d+)$", lambda m: "_M" + m.group(1), new)
+        if new != c:
+            renames[c] = new
+    df = df.rename(columns=renames)
+
+    # purl under another name
+    if "purl" not in df.columns:
+        for alt in PURL_ALIASES:
+            if alt in df.columns and df[alt].astype(str).str.startswith("pkg:").any():
+                df = df.rename(columns={alt: "purl"})
+                break
+    # the schema names its target columns in lower case already; make sure of it
+    return df
+
+
+def read_csv_flexible(path: str | Path) -> pd.DataFrame:
+    """Read a CSV with comma or semicolon, with or without BOM."""
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    if df.shape[1] == 1:  # probably another separator
+        df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    return normalize_columns(df)
+
+
+def package_name_from_purl(purl: str) -> str:
+    """Return npm package name from pkg:npm/name@version PURL."""
+    if not isinstance(purl, str):
+        raise ValueError(f"Invalid npm PURL: {purl!r}")
+    purl = purl.strip().replace("%40", "@")  # scoped packages: pkg:npm/%40scope/name@1.0.0
+    if not purl.startswith("pkg:npm/"):
+        raise ValueError(f"Invalid npm PURL: {purl!r}")
+    value = purl[len("pkg:npm/"):]
+    if "@" not in value.lstrip("@"):
+        raise ValueError(f"PURL has no version: {purl!r}")
+    return value.rsplit("@", 1)[0]
+
+
+def stable_version_from_purl(purl: str):
+    """Parse stable semver; return None for prereleases or invalid versions."""
     try:
-        x = float(str(value).strip())
-    except ValueError:
-        return None
-    return x if 0 <= x < float("inf") else None
+        name = package_name_from_purl(purl)
+        raw_version = purl.strip().rsplit("@", 1)[1]
+        parsed = Version(raw_version)
+        if parsed.is_prerelease or parsed.is_devrelease:
+            return name, None
+        return name, parsed
+    except (ValueError, InvalidVersion):
+        return None, None
 
 
-def read_rows(path):
-    """Read the CSV into a list of dicts. Accepts , or ; and a BOM."""
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        text = f.read()
-    first_line = text.split("\n", 1)[0]
-    delimiter = ";" if first_line.count(";") > first_line.count(",") else ","
+def newest_row_without_purl(df: pd.DataFrame) -> pd.DataFrame:
+    """Input without purl: all rows are one package. Without a version number we take the
+    row with the newest published_at (the last row if there is no date)."""
+    if df.empty:
+        raise ValueError("Input CSV has no records.")
+    idx = df.index[-1]
+    if "published_at" in df.columns:
+        dates = pd.to_datetime(df["published_at"], errors="coerce", utc=True)
+        if dates.notna().any():
+            idx = dates.idxmax()
+    row = df.loc[idx].to_dict()
+    row["package_name"] = "unknown"
+    return add_date_features(pd.DataFrame([row]))
+
+
+def make_package_dataset(input_csv: str | Path,
+                         require_targets: bool = True) -> Tuple[pd.DataFrame, list[str]]:
+    """One row per package. For training, require_targets=True.
+    For predict.py use require_targets=False (the input needs no target columns)."""
+    df = read_csv_flexible(input_csv)
+    # The files of the prediction rounds have no purl column. They contain the versions of
+    # exactly one package, so all rows belong together.
+    if "purl" not in df.columns and not require_targets:
+        return newest_row_without_purl(df), TARGETS
+    required = {"purl", *(TARGETS if require_targets else [])}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(
+            f"Input CSV is missing required columns: {missing}. "
+            f"First columns found in the file: {list(df.columns[:8])}"
+        )
+
+    parsed = df["purl"].apply(stable_version_from_purl)
+    df["_package"] = parsed.apply(lambda x: x[0])
+    df["_version"] = parsed.apply(lambda x: x[1])
+    df = df[df["_version"].notna()].copy()
+    if df.empty:
+        raise ValueError("No stable npm package versions found in input CSV.")
+
     rows = []
-    for row in csv.DictReader(io.StringIO(text), delimiter=delimiter):
-        rows.append({(k or "").strip(): v for k, v in row.items()})
-    return rows
+    inconsistent = []
+    for package, group in df.groupby("_package", sort=True):
+        # The package-level target should be identical across all versions.
+        if require_targets:
+            target_values = group[TARGETS].apply(pd.to_numeric, errors="coerce")
+            if (target_values.nunique(dropna=False) > 1).any():
+                inconsistent.append(package)
+                continue
+
+        latest_idx = max(group.index, key=lambda idx: group.loc[idx, "_version"])
+        row = group.loc[latest_idx].drop(labels=["_package", "_version"]).to_dict()
+        row["package_name"] = package
+        rows.append(row)
+
+    if inconsistent:
+        preview = ", ".join(inconsistent[:10])
+        raise ValueError(
+            "Targets are not identical across versions for these packages: " + preview
+            + (" ..." if len(inconsistent) > 10 else "")
+            + ". Check the builder's target calculation before training."
+        )
+
+    result = pd.DataFrame(rows).reset_index(drop=True)
+    result = add_date_features(result)
+    return result, TARGETS
 
 
-def package_name(purl):
-    return (purl or "").rsplit("@", 1)[0]
+def add_date_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for source, output in [
+        ("package_created_at", "package_age_days_at_cutoff"),
+        ("published_at", "version_age_days_at_cutoff"),
+    ]:
+        if source in df.columns:
+            dates = pd.to_datetime(df[source], errors="coerce", utc=True)
+            df[output] = (AS_OF_DATE - dates).dt.total_seconds() / 86400.0
+    return df
 
 
-def version_key(purl):
-    """Semantic version from the PURL as numbers: pkg:npm/a@1.10.2 -> (1, 10, 2)."""
-    m = re.search(r"@(\d+)\.(\d+)\.(\d+)", purl or "")
-    return tuple(int(x) for x in m.groups()) if m else (-1, -1, -1)
+def get_feature_columns(df: pd.DataFrame) -> list[str]:
+    excluded = set(TARGETS) | {"purl", "package_name", "package_created_at", "published_at"}
+    candidates = [c for c in df.columns if c not in excluded]
+    numeric = df[candidates].apply(pd.to_numeric, errors="coerce")
+    # Remove columns that contain no usable values or no variation.
+    return [c for c in numeric.columns if numeric[c].notna().any() and numeric[c].nunique(dropna=True) > 1]
 
 
-def merge_rows(rows):
-    """The data of one package as ONE dict: the newest version (highest semver) wins;
-    a missing value is taken from the next older version."""
-    rows = sorted(rows, key=lambda r: version_key(r.get("purl")), reverse=True)
-    merged = {}
-    for row in rows:
-        for column, value in row.items():
-            if column not in merged or is_missing(merged[column]):
-                merged[column] = value
-    return merged
+def main():
+    parser = argparse.ArgumentParser(description="Create one feature/target row per npm package.")
+    parser.add_argument("input", nargs="?", default="training_data.csv")
+    parser.add_argument("--output", default="package_training_data.csv")
+    args = parser.parse_args()
+
+    packages, _ = make_package_dataset(args.input)
+    packages.to_csv(args.output, index=False)
+    print(f"Saved {len(packages)} package rows to {args.output}")
+    print(f"Selected latest stable version for {packages['package_name'].nunique()} packages.")
+    print(f"Target columns: {', '.join(TARGETS)}")
 
 
-# ---------------------------------------------------------------- features
-def num(rec, column):
-    x = to_number(rec.get(column))
-    return NAN if x is None else x
-
-
-def month_sum(rec, name, months, zero_if_missing=False):
-    """Sum of <name>_M<i> over the given months. NaN (or 0) if every value is missing."""
-    values = [to_number(rec.get("%s_M%d" % (name, m))) for m in months]
-    values = [v for v in values if v is not None]
-    if not values:
-        return 0.0 if zero_if_missing else NAN
-    return float(sum(values))
-
-
-def age_in_days(text):
-    """Days between the package creation and the prediction date (NaN if unknown)."""
-    try:
-        t = datetime.fromisoformat(str(text).strip().replace("Z", "+00:00"))
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        return (PREDICTION_DATE - t).total_seconds() / 86400.0
-    except Exception:
-        return NAN
-
-
-def recent_rate(rec, severity):
-    """Advisories per 90 days, from the last 12 months (used by the simple rule)."""
-    return month_sum(rec, "ghsa_%s_count" % severity, range(12), True) * 3.0 / 12.0
-
-
-def feature_dict(rec):
-    """All features of one package. Unknown values are NaN (XGBoost can handle NaN)."""
-    f = {}
-    windows = {"3m": range(0, 3), "6m": range(0, 6), "12m": range(0, 12)}
-    for sev in KNOWN + ("all",):
-        sevs = SEVERITIES if sev == "all" else (sev,)
-        for label, months in windows.items():
-            f["ghsa_%s_%s" % (sev, label)] = sum(
-                month_sum(rec, "ghsa_%s_count" % s, months, True) for s in sevs)
-        f["ghsa_%s_lifetime" % sev] = sum(to_number(rec.get("ghsa_%s_count" % s)) or 0.0
-                                          for s in sevs)
-    f["downloads_log_m0"] = math.log1p(num(rec, "package_downloads_M0"))
-    f["downloads_log_12m"] = math.log1p(month_sum(rec, "package_downloads", range(12)))
-    f["downloads_trend"] = (math.log1p(month_sum(rec, "package_downloads", range(0, 3)))
-                            - math.log1p(month_sum(rec, "package_downloads", range(9, 12))))
-    f["releases_3m"] = month_sum(rec, "package_stable_release_count", range(0, 3))
-    f["releases_12m"] = month_sum(rec, "package_stable_release_count", range(12))
-    for name in ("issues_opened", "issues_closed", "pull_requests_opened",
-                 "pull_requests_merged", "pull_requests_closed_unmerged"):
-        f["%s_6m" % name] = month_sum(rec, name, range(0, 6))
-    f["issues_open_now"] = num(rec, "issues_open_at_month_end_M0")
-    f["pull_requests_open_now"] = num(rec, "pull_requests_open_at_month_end_M0")
-    for column in ("dependency_count", "optional_dependency_count", "peer_dependency_count",
-                   "dev_dependency_count", "bundled_dependency_count", "file_count"):
-        f[column] = num(rec, column)
-    f["unpacked_size_log"] = math.log1p(num(rec, "unpacked_size"))
-    f["package_age_days"] = age_in_days(rec.get("package_created_at") or rec.get("created_at"))
-    return f
-
-
-FEATURE_NAMES = list(feature_dict({}).keys())
-
-
-def feature_vector(rec):
-    f = feature_dict(rec)
-    return [f[name] for name in FEATURE_NAMES]
-
-
-# ---------------------------------------------------------------- simple fallback rule
-def rule_prediction(rec, meta):
-    """Expected new advisories per severity: mix of the package's own rate in the last
-    12 months and the average of the training packages."""
-    w = meta["weight_recent"]
-    return {sev: w * recent_rate(rec, sev) + (1.0 - w) * meta["global_mean"][sev]
-            for sev in SEVERITIES}
+if __name__ == "__main__":
+    main()
