@@ -112,4 +112,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)python3 -m venv .venv
+    uvicorn.run(app, host="0.0.0.0", port=8000)
